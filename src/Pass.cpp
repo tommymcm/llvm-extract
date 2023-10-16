@@ -64,6 +64,10 @@ static cl::opt<bool> Recursive(
     cl::desc("Recursively extract all called functions"),
     cl::cat(ExtractCat));
 
+static cl::opt<bool> RecurseOnGlobals("recurse-on-globals",
+                                      cl::desc("Include globals in recursion"),
+                                      cl::cat(ExtractCat));
+
 // ExtractFuncs - The functions to extract from the module.
 static cl::list<std::string> ExtractFuncs(
     "func",
@@ -439,16 +443,30 @@ int main(int argc, char **argv) {
       ExitOnErr(F->materialize());
       for (auto &BB : *F) {
         for (auto &I : BB) {
-          CallBase *CB = dyn_cast<CallBase>(&I);
-          if (!CB)
-            continue;
-          Function *CF = CB->getCalledFunction();
-          if (!CF)
-            continue;
-          if (CF->isDeclaration() || GVs.count(CF))
-            continue;
-          GVs.insert(CF);
-          Workqueue.push_back(CF);
+          if (RecurseOnGlobals) {
+            // Recurse on all GlobalValue operands of this instruction.
+            // Add to the queue if it is a function.
+            for (auto &operand : I.operands()) {
+              auto *operand_as_gv = dyn_cast<llvm::GlobalValue>(&operand);
+              if (!operand_as_gv) {
+                continue;
+              }
+              GVs.insert(operand_as_gv);
+              if (auto *operand_as_function =
+                      dyn_cast<llvm::Function>(operand_as_gv)) {
+                Workqueue.push_back(operand_as_function);
+              }
+            }
+          } else {
+            CallBase *CB = dyn_cast<CallBase>(&I);
+            Function *CF = CB->getCalledFunction();
+            if (!CF)
+              continue;
+            if (CF->isDeclaration() || GVs.count(CF))
+              continue;
+            GVs.insert(CF);
+            Workqueue.push_back(CF);
+          }
         }
       }
     }
@@ -470,10 +488,15 @@ int main(int argc, char **argv) {
   }
 
   {
-    std::vector<GlobalValue *> Gvs(GVs.begin(), GVs.end());
-    legacy::PassManager Extract;
-    Extract.add(createGVExtractionPass(Gvs, DeleteFn));
-    Extract.run(*M);
+
+    SetVector<GlobalValue *> Gvs(GVs.begin(), GVs.end());
+    bool modified = extract_globals(*M, Gvs, DeleteFn, KeepConstInit);
+    // BEGIN OLD
+    // std::vector<GlobalValue *> Gvs(GVs.begin(), GVs.end());
+    // legacy::PassManager Extract;
+    // Extract.add(createGVExtractionPass(Gvs, DeleteFn));
+    // Extract.run(*M);
+    // END OLD
 
     // Now that we have all the GVs we want, mark the module as fully
     // materialized.
@@ -484,8 +507,9 @@ int main(int argc, char **argv) {
   // Extract the specified basic blocks from the module and erase the existing
   // functions.
   if (!ExtractBlocks.empty()) {
-    SetVector<GlobalValue *> Gvs(GVs.begin(), GVs.end());
-    bool modified = extract_globals(*M, Gvs, DeleteFn, KeepConstInit);
+    legacy::PassManager PM;
+    PM.add(createBlockExtractorPass(GroupOfBBs, true));
+    PM.run(*M);
   }
 
   // In addition to deleting all other functions, we also want to spiff it
